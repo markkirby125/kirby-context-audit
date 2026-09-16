@@ -1,0 +1,577 @@
+#!/usr/bin/env python3
+"""
+ai-context-audit: Cross-IDE AI Coding Agent Context Bloat & Skill Health Auditor
+Scans global and workspace configurations across Antigravity, Cursor, Windsurf,
+Grok, Kimi, and Reasonix to detect context bloat, token burn, and broken symlinks.
+"""
+
+import os
+import sys
+import json
+import re
+import argparse
+from pathlib import Path
+
+# Optional PyYAML support with fallback
+try:
+    import yaml
+    HAS_YAML = True
+except ImportError:
+    HAS_YAML = False
+
+# Optional tiktoken support with fallback heuristic
+try:
+    import tiktoken
+    _ENC = tiktoken.get_encoding("cl100k_base")
+    def count_tokens(text: str) -> int:
+        if not text:
+            return 0
+        return len(_ENC.encode(text, disallowed_special=()))
+except ImportError:
+    def count_tokens(text: str) -> int:
+        if not text:
+            return 0
+        chars = len(text)
+        return max(1, int(chars / 3.85))
+
+# ANSI Color codes
+BOLD = "\033[1m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+RED = "\033[31m"
+CYAN = "\033[36m"
+MAGENTA = "\033[35m"
+DIM = "\033[2m"
+RESET = "\033[0m"
+
+def colorize(text: str, color: str) -> str:
+    if sys.stdout.isatty():
+        return f"{color}{text}{RESET}"
+    return text
+
+def bold(text: str) -> str:
+    if sys.stdout.isatty():
+        return f"{BOLD}{text}{RESET}"
+    return text
+
+APP_TARGETS = [
+    {
+        "name": "Antigravity",
+        "cli_name": "agy",
+        "type": "progressive",
+        "paths": [os.path.expanduser("~/.gemini/config/skills")],
+    },
+    {
+        "name": "Cursor",
+        "cli_name": "cursor",
+        "type": "hybrid",
+        "paths": [os.path.expanduser("~/.cursor/skills"), os.path.expanduser("~/.cursor/skills-cursor")],
+    },
+    {
+        "name": "Windsurf",
+        "cli_name": "windsurf",
+        "type": "hybrid",
+        "paths": [os.path.expanduser("~/.codeium/windsurf/skills")],
+    },
+    {
+        "name": "Grok",
+        "cli_name": "grok",
+        "type": "progressive",
+        "paths": [os.path.expanduser("~/.grok/skills")],
+    },
+    {
+        "name": "Kimi Code",
+        "cli_name": "kimi",
+        "type": "progressive",
+        "paths": [os.path.expanduser("~/.kimi-code/skills")],
+    },
+    {
+        "name": "Reasonix",
+        "cli_name": "reasonix",
+        "type": "progressive",
+        "paths": [os.path.expanduser("~/.reasonix/skills")],
+    },
+]
+
+FRONTMATTER_RE = re.compile(r"^---\r?\n(.*?)\r?\n---", re.DOTALL)
+
+def parse_frontmatter(content: str):
+    clean = content.lstrip("\ufeff\n\r ")
+    match = FRONTMATTER_RE.match(clean)
+    if not match:
+        return None, None
+    
+    raw_yaml = match.group(1)
+    if HAS_YAML:
+        try:
+            data = yaml.safe_load(raw_yaml)
+            if isinstance(data, dict):
+                return data.get("name"), data.get("description")
+        except yaml.YAMLError:
+            pass
+    else:
+        # Minimal fallback if PyYAML is missing
+        name, desc = None, None
+        for line in raw_yaml.splitlines():
+            line_str = line.strip()
+            if line_str.startswith("name:"):
+                name = line_str.split(":", 1)[1].strip().strip("\"'")
+            elif line_str.startswith("description:"):
+                desc = line_str.split(":", 1)[1].strip().strip("\"'")
+        return name, desc
+
+    return None, None
+
+def audit_skill_entry(entry_path: Path):
+    is_link = entry_path.is_symlink()
+    link_target = None
+    if is_link:
+        try:
+            link_target = str(entry_path.resolve())
+        except RuntimeError:
+            link_target = "UNRESOLVABLE (Loop)"
+        except Exception:
+            link_target = "UNRESOLVABLE"
+
+    if is_link and not entry_path.exists():
+        return {
+            "name": entry_path.name,
+            "path": str(entry_path),
+            "target_file": None,
+            "is_link": True,
+            "target": link_target,
+            "status": "BROKEN",
+            "progressive_tokens": 0,
+            "bruteforce_tokens": 0,
+            "is_hollow": False,
+            "file_size": 0,
+            "notes": "Dead symlink",
+        }
+
+    target_file = None
+    if entry_path.is_dir():
+        for candidate in ["SKILL.md", "skill.md", "README.md", "prompt.md"]:
+            cf = entry_path / candidate
+            if cf.is_file():
+                target_file = cf
+                break
+    elif entry_path.is_file():
+        target_file = entry_path
+
+    if not target_file or not target_file.exists():
+        return {
+            "name": entry_path.name,
+            "path": str(entry_path),
+            "target_file": None,
+            "is_link": is_link,
+            "target": link_target,
+            "status": "NO_ENTRYPOINT",
+            "progressive_tokens": 0,
+            "bruteforce_tokens": 0,
+            "is_hollow": False,
+            "file_size": 0,
+            "notes": "Missing SKILL.md or entrypoint",
+        }
+
+    try:
+        file_size = target_file.stat().st_size
+    except Exception:
+        file_size = 0
+
+    try:
+        # Prevent OOM by reading max 5MB
+        with target_file.open("r", encoding="utf-8", errors="replace") as f:
+            content = f.read(5 * 1024 * 1024)
+    except Exception as e:
+        return {
+            "name": entry_path.name,
+            "path": str(entry_path),
+            "target_file": str(target_file),
+            "is_link": is_link,
+            "target": link_target,
+            "status": "UNREADABLE",
+            "progressive_tokens": 0,
+            "bruteforce_tokens": 0,
+            "is_hollow": False,
+            "file_size": file_size,
+            "notes": f"Read error: {e}",
+        }
+
+    bruteforce_tokens = count_tokens(content)
+
+    # Hollow shell signature check
+    has_hollow_sig = bool(
+        "references/00_dispatcher.md" in content or
+        "references/dispatcher.md" in content or
+        "To execute this skill, you MUST first read" in content or
+        "read the dispatcher instructions" in content
+    )
+
+    is_hollow = False
+    dispatcher_missing = False
+    if has_hollow_sig:
+        # Verify physical existence of referenced dispatcher
+        base_dir = target_file.parent
+        d1 = base_dir / "references" / "00_dispatcher.md"
+        d2 = base_dir / "references" / "dispatcher.md"
+        if d1.exists() or d2.exists():
+            is_hollow = True
+        else:
+            dispatcher_missing = True
+
+    name, desc = parse_frontmatter(content)
+    if not name:
+        name = entry_path.name
+
+    if desc:
+        prog_snippet = f"- {name} ({target_file}): {desc}\n"
+        progressive_tokens = count_tokens(prog_snippet)
+    else:
+        progressive_tokens = bruteforce_tokens
+
+    if dispatcher_missing:
+        status = "CRITICAL"
+        notes = "Hollow shell signature detected but dispatcher file is MISSING"
+    elif is_hollow or bruteforce_tokens <= 250:
+        status = "OPTIMAL"
+        notes = "Hollow Shell active" if is_hollow else "Lean skill"
+    elif bruteforce_tokens <= 1000:
+        status = "MODERATE"
+        notes = "Moderate size (250-1000 tokens)"
+    else:
+        status = "BLOAT_RISK"
+        notes = "Monolithic root (>1000 tokens)"
+
+    return {
+        "name": name,
+        "path": str(entry_path),
+        "target_file": str(target_file),
+        "is_link": is_link,
+        "target": link_target,
+        "status": status,
+        "is_hollow": is_hollow,
+        "file_size": file_size,
+        "progressive_tokens": progressive_tokens,
+        "bruteforce_tokens": bruteforce_tokens,
+        "notes": notes,
+    }
+
+def audit_directory(dir_path: str):
+    p = Path(dir_path)
+    if not p.exists() or not p.is_dir():
+        return None
+
+    results = []
+    try:
+        entries = sorted(list(p.iterdir()), key=lambda x: x.name)
+    except Exception:
+        return None
+
+    for entry in entries:
+        if entry.name.startswith("."):
+            continue
+        res = audit_skill_entry(entry)
+        results.append(res)
+    return results
+
+def audit_workspace(ws_path: Path):
+    if not ws_path.exists() or not ws_path.is_dir():
+        return []
+
+    candidates = [
+        "AGENTS.md", 
+        "CLAUDE.md", 
+        "GEMINI.md", 
+        ".cursorrules", 
+        ".windsurfrules",
+        ".github/copilot-instructions.md"
+    ]
+    found = []
+    
+    # Check root and candidate files
+    for cand in candidates:
+        cf = ws_path / cand
+        if cf.is_file():
+            try:
+                file_size = cf.stat().st_size
+                with cf.open("r", encoding="utf-8", errors="replace") as f:
+                    content = f.read(5 * 1024 * 1024)
+                tokens = count_tokens(content)
+                status = "OPTIMAL" if tokens < 1000 else "BLOAT_RISK"
+                found.append({
+                    "name": cand,
+                    "path": str(cf),
+                    "status": status,
+                    "tokens": tokens,
+                    "size": file_size,
+                })
+            except Exception as e:
+                found.append({
+                    "name": cand,
+                    "path": str(cf),
+                    "status": "UNREADABLE",
+                    "tokens": 0,
+                    "size": 0,
+                    "error": str(e),
+                })
+                
+    # Check .cursor/rules/**/*.mdc recursively
+    cursor_rules_dir = ws_path / ".cursor" / "rules"
+    if cursor_rules_dir.is_dir():
+        try:
+            for rule_file in sorted(cursor_rules_dir.rglob("*.mdc")):
+                try:
+                    rel_name = rule_file.relative_to(ws_path)
+                    file_size = rule_file.stat().st_size
+                    with rule_file.open("r", encoding="utf-8", errors="replace") as f:
+                        content = f.read(5 * 1024 * 1024)
+                    tokens = count_tokens(content)
+                    status = "OPTIMAL" if tokens < 1000 else "BLOAT_RISK"
+                    found.append({
+                        "name": str(rel_name),
+                        "path": str(rule_file),
+                        "status": status,
+                        "tokens": tokens,
+                        "size": file_size,
+                    })
+                except Exception as e:
+                    found.append({
+                        "name": str(rule_file.name),
+                        "path": str(rule_file),
+                        "status": "UNREADABLE",
+                        "tokens": 0,
+                        "size": 0,
+                        "error": str(e),
+                    })
+        except Exception:
+            pass
+
+    return found
+
+def main():
+    parser = argparse.ArgumentParser(description="Audit AI coding apps for context bloat, token burn, and broken skill symlinks.")
+    parser.add_argument("--json", action="store_true", help="Output audit results in raw JSON format.")
+    parser.add_argument("-v", "--detailed", action="store_true", help="Show detailed per-skill breakdown.")
+    parser.add_argument("--app", type=str, default=None, help="Filter audit to a specific app.")
+    parser.add_argument("--workspace", action="store_true", help="Also audit the current workspace root for rule files.")
+    parser.add_argument("--workspace-path", type=str, default=None, help="Custom directory path to audit for workspace rule files.")
+    parser.add_argument("--fix-hints", action="store_true", help="Display actionable instructions for fixing detected issues.")
+    args = parser.parse_args()
+
+    # Filter apps if requested
+    matched_targets = []
+    if args.app:
+        query = args.app.lower().strip()
+        for app in APP_TARGETS:
+            if query == app["name"].lower() or query == app["cli_name"] or query in app["name"].lower():
+                matched_targets.append(app)
+        if not matched_targets:
+            err_msg = f"Error: No AI coding app found matching '{args.app}'. Available: {', '.join(a['name'] for a in APP_TARGETS)}"
+            if args.json:
+                print(json.dumps({"error": err_msg, "available_apps": [a["name"] for a in APP_TARGETS]}))
+            else:
+                print(colorize(err_msg, RED), file=sys.stderr)
+            sys.exit(2)
+    else:
+        matched_targets = APP_TARGETS
+
+    overall_report = {
+        "apps": {},
+        "workspace": None,
+        "summary": {
+            "total_skills_detected": 0,
+            "optimal_skills": 0,
+            "moderate_skills": 0,
+            "bloat_risks": 0,
+            "broken_symlinks": 0,
+            "unreadable_count": 0,
+            "no_entry_count": 0,
+            "critical_count": 0,
+        }
+    }
+
+    for app in matched_targets:
+        app_skills = []
+        for path_str in app["paths"]:
+            dir_res = audit_directory(path_str)
+            if dir_res is not None:
+                app_skills.extend(dir_res)
+
+        if not app_skills:
+            overall_report["apps"][app["name"]] = {
+                "installed": False,
+                "paths": app["paths"],
+                "skills_count": 0,
+            }
+            continue
+
+        total_prog = sum(s["progressive_tokens"] for s in app_skills)
+        total_brute = sum(s["bruteforce_tokens"] for s in app_skills)
+        
+        optimal = sum(1 for s in app_skills if s["status"] == "OPTIMAL")
+        moderate = sum(1 for s in app_skills if s["status"] == "MODERATE")
+        risks = sum(1 for s in app_skills if s["status"] == "BLOAT_RISK")
+        broken = sum(1 for s in app_skills if s["status"] == "BROKEN")
+        unreadable = sum(1 for s in app_skills if s["status"] == "UNREADABLE")
+        no_entry = sum(1 for s in app_skills if s["status"] == "NO_ENTRYPOINT")
+        critical = sum(1 for s in app_skills if s["status"] == "CRITICAL")
+
+        overall_report["summary"]["total_skills_detected"] += len(app_skills)
+        overall_report["summary"]["optimal_skills"] += optimal
+        overall_report["summary"]["moderate_skills"] += moderate
+        overall_report["summary"]["bloat_risks"] += risks
+        overall_report["summary"]["broken_symlinks"] += broken
+        overall_report["summary"]["unreadable_count"] += unreadable
+        overall_report["summary"]["no_entry_count"] += no_entry
+        overall_report["summary"]["critical_count"] += critical
+
+        overall_report["apps"][app["name"]] = {
+            "installed": True,
+            "type": app["type"],
+            "paths": app["paths"],
+            "skills_count": len(app_skills),
+            "progressive_tokens": total_prog,
+            "bruteforce_tokens": total_brute,
+            "optimal_count": optimal,
+            "moderate_count": moderate,
+            "bloat_risks_count": risks,
+            "broken_count": broken,
+            "unreadable_count": unreadable,
+            "no_entry_count": no_entry,
+            "critical_count": critical,
+            "skills": app_skills,
+        }
+
+    # Verify reconciliation assertion
+    s = overall_report["summary"]
+    assert s["total_skills_detected"] == (
+        s["optimal_skills"] + 
+        s["moderate_skills"] + 
+        s["bloat_risks"] + 
+        s["broken_symlinks"] + 
+        s["unreadable_count"] + 
+        s["no_entry_count"] + 
+        s["critical_count"]
+    ), "Accounting inconsistency detected in summary calculation!"
+
+    if args.workspace or args.workspace_path:
+        target_ws = Path(args.workspace_path) if args.workspace_path else Path.cwd()
+        overall_report["workspace"] = audit_workspace(target_ws)
+
+    total_errors = s['broken_symlinks'] + s['unreadable_count'] + s['no_entry_count'] + s['critical_count']
+
+    if args.json:
+        print(json.dumps(overall_report, indent=2))
+        sys.exit(1 if total_errors > 0 else 0)
+
+    print(f"\n{bold(colorize('=== AI Coding Assistant Context Bloat & Skill Auditor ===', CYAN))}\n")
+
+    for app_name, data in overall_report["apps"].items():
+        if not data["installed"]:
+            print(colorize(f"[{app_name}] Not found or no skills configured in default paths.", DIM))
+            continue
+
+        count = data["skills_count"]
+        broken = data.get("broken_count", 0)
+        unreadable = data.get("unreadable_count", 0)
+        no_entry = data.get("no_entry_count", 0)
+        critical = data.get("critical_count", 0)
+        risks = data.get("bloat_risks_count", 0)
+
+        errors = broken + unreadable + no_entry + critical
+        
+        if errors > 0:
+            status_badge = colorize(f"CRITICAL ({errors} Errors/Broken)", RED)
+        elif risks > 0:
+            status_badge = colorize(f"WARNING ({risks} Bloat Risks)", YELLOW)
+        else:
+            status_badge = colorize("OPTIMAL (Protected)", GREEN)
+
+        print(f"{bold('● ' + app_name)} ({count} skills installed) -> {status_badge}")
+        print(f"  {colorize('Paths:', DIM)} {', '.join(data['paths'])}")
+        print(f"  {colorize('Progressive Disclosure Index:', CYAN)} {data['progressive_tokens']:,} tokens {colorize('(Initial metadata injection)', DIM)}")
+        print(f"  {colorize('Brute-Force Injected Load:', MAGENTA)}    {data['bruteforce_tokens']:,} tokens {colorize('(Worst-case naive full load)', DIM)}")
+
+        if args.detailed:
+            print(f"\n  {colorize(f'SKILL                            STATUS          TOKENS     DETAILS', DIM)}")
+            print(f"  {colorize('-'*75, DIM)}")
+            for s_entry in data["skills"]:
+                st = s_entry["status"]
+                st_str = f"{st:<15}"
+                if st == "OPTIMAL":
+                    st_col = colorize(st_str, GREEN)
+                elif st == "MODERATE":
+                    st_col = colorize(st_str, YELLOW)
+                else:
+                    st_col = colorize(st_str, RED)
+                
+                tok_str = f"{s_entry['bruteforce_tokens']:,}"
+                notes = s_entry["notes"]
+                if s_entry["status"] in ("BROKEN", "UNREADABLE", "NO_ENTRYPOINT", "CRITICAL"):
+                    notes_display = colorize(f"{notes[:45]}", RED)
+                elif s_entry["is_link"] and s_entry["target"]:
+                    notes_display = f"{colorize('-> ' + s_entry['target'][:35] + '...', DIM)}"
+                else:
+                    notes_display = notes[:45]
+                print(f"  {s_entry['name'][:30]:<32} {st_col} {tok_str:<10} {notes_display}")
+            print()
+        else:
+            if broken > 0:
+                print(f"  {colorize(f'↳ ⚠️  {broken} broken symlink(s) detected!', RED)}")
+            if unreadable > 0:
+                print(f"  {colorize(f'↳ ⚠️  {unreadable} unreadable file(s)!', RED)}")
+            if no_entry > 0:
+                print(f"  {colorize(f'↳ ⚠️  {no_entry} missing entrypoint(s)!', RED)}")
+            if critical > 0:
+                print(f"  {colorize(f'↳ ⚠️  {critical} critical dispatcher failure(s)!', RED)}")
+            if risks > 0:
+                print(f"  {colorize(f'↳ ⚠️  {risks} monolithic skill(s) exceeding 1,000 tokens!', YELLOW)}")
+        print()
+
+    # Workspace report if requested
+    if args.workspace or args.workspace_path:
+        target_ws = Path(args.workspace_path) if args.workspace_path else Path.cwd()
+        ws_files = overall_report["workspace"] or []
+        print(bold(f"● Workspace Rules ({len(ws_files)} files found in {target_ws})"))
+        if not ws_files:
+            print(colorize("  (No rule files detected in this workspace directory)", DIM))
+        else:
+            for wf in ws_files:
+                st = wf["status"]
+                st_col = colorize(f"{st:<12}", GREEN if st == "OPTIMAL" else RED)
+                tok_str = f"{wf.get('tokens', 0):,} tokens"
+                print(f"  {wf['name']:<32} {st_col} {tok_str:<12} {wf['path']}")
+        print()
+
+    print(bold("-------------------------------------------------------------"))
+    print(f"{bold('Summary:')} {s['total_skills_detected']} total skills scanned across active apps.")
+    
+    if total_errors == 0 and s["bloat_risks"] == 0:
+        print(f"{bold(colorize('✓ ALL SYSTEMS OPTIMAL:', GREEN))} {s['optimal_skills']} optimal, {s['moderate_skills']} moderate. Zero errors, zero bloat risks.")
+    else:
+        print(f"{colorize('Audit Breakdown:', YELLOW)} {s['optimal_skills']} optimal, {s['moderate_skills']} moderate, {s['bloat_risks']} bloat risks, {total_errors} errors ({s['broken_symlinks']} broken, {s['unreadable_count']} unreadable, {s['no_entry_count']} missing entry, {s['critical_count']} missing dispatcher).")
+
+    if args.fix_hints:
+        print(f"\n{bold(colorize('Fix Suggestions & Remediation:', CYAN))}")
+        if total_errors > 0:
+            print("  • Broken symlinks / Missing entrypoints:")
+            print("    [CAUTION: Verify before deleting] To clean broken symlinks across all apps:")
+            print("    find ~/.cursor ~/.codeium ~/.reasonix ~/.grok ~/.gemini ~/.kimi-code -xtype l -delete")
+            print("    Ensure every skill directory contains a valid SKILL.md or README.md.")
+        if s["critical_count"] > 0:
+            print("  • Missing Dispatchers:")
+            print("    Ensure every hollow shell skill has its referenced `references/00_dispatcher.md` file present.")
+        if s["bloat_risks"] > 0:
+            print("  • Monolithic Bloat Risks (>1000 tokens):")
+            print("    Apply the Hollow Shell pattern:")
+            print("    - Relocate instructional body to `references/00_dispatcher.md`")
+            print("    - Keep root `SKILL.md` under 150 tokens with frontmatter + dispatcher reference.")
+
+    print(f"{colorize('Use ai-context-audit -v for per-skill inspection, or --json for programmatic output.', DIM)}\n")
+
+    if total_errors > 0:
+        sys.exit(1)
+    sys.exit(0)
+
+if __name__ == "__main__":
+    main()
