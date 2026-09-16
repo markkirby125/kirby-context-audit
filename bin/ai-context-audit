@@ -10,6 +10,7 @@ import sys
 import json
 import re
 import argparse
+from dataclasses import dataclass
 from pathlib import Path
 
 # Optional PyYAML support with fallback
@@ -54,6 +55,9 @@ def bold(text: str) -> str:
         return f"{BOLD}{text}{RESET}"
     return text
 
+# OOM guard: never pull more than this much of a single file into memory.
+MAX_READ_BYTES = 5 * 1024 * 1024
+
 APP_TARGETS = [
     {
         "name": "Antigravity",
@@ -93,14 +97,184 @@ APP_TARGETS = [
     },
 ]
 
+# Workspace-wide instruction files, looked up directly in the workspace root.
+WORKSPACE_RULE_FILES = (
+    "AGENTS.md",
+    "CLAUDE.md",
+    "GEMINI.md",
+    ".cursorrules",
+    ".windsurfrules",
+    ".github/copilot-instructions.md",
+)
+
+# Recursive rule file sets: (directory relative to the workspace root, glob pattern).
+WORKSPACE_RULE_GLOBS = (
+    (".cursor/rules", "*.mdc"),
+)
+
+# Token count at or above which a workspace rule file is a bloat risk.
+WORKSPACE_BLOAT_LIMIT = 1000
+
 FRONTMATTER_RE = re.compile(r"^---\r?\n(.*?)\r?\n---", re.DOTALL)
+
+# ---------------------------------------------------------------------------
+# Status model
+#
+# Every verdict the auditor can emit is declared once, right here. The summary
+# counters, JSON keys, per-app badge, warning lines, detailed table cells and
+# remediation hints are all derived from this registry, so adding a new status
+# means adding one entry (plus a hint block if it needs one) instead of editing
+# hardcoded lists scattered across main().
+# ---------------------------------------------------------------------------
+
+KIND_ERROR = "error"
+KIND_RISK = "risk"
+KIND_OK = "ok"
+
+
+@dataclass(frozen=True)
+class StatusKind:
+    """A severity band shared by one or more statuses."""
+    name: str
+    label: str            # plural noun used in summary sentences
+    badge: str            # app badge template, {n} = count
+    color: str
+    is_problem: bool      # participates in error gating / warning output
+    fix_hint: str = None  # remediation block shared by the whole kind
+
+
+# Order matters: most severe first. It drives badge precedence, warning order
+# and remediation-hint order.
+STATUS_KINDS = (
+    StatusKind(KIND_ERROR, "errors", "CRITICAL ({n} Errors/Broken)", RED, True,
+               fix_hint="broken_links"),
+    StatusKind(KIND_RISK, "bloat risks", "WARNING ({n} Bloat Risks)", YELLOW, True,
+               fix_hint="hollow_shell"),
+    StatusKind(KIND_OK, "ok", "OPTIMAL (Protected)", GREEN, False),
+)
+KIND_BY_NAME = {kind.name: kind for kind in STATUS_KINDS}
+KIND_SEVERITY = {kind.name: index for index, kind in enumerate(STATUS_KINDS)}
+
+
+@dataclass(frozen=True)
+class SkillStatus:
+    """One audit verdict for a skill entry, fully self-describing."""
+    name: str                  # literal value stored in the "status" field
+    kind: str                  # key into KIND_BY_NAME
+    summary_key: str           # counter key inside report["summary"]
+    app_key: str               # counter key inside each per-app block
+    label: str                 # phrase used in breakdown/summary sentences
+    detail_label: str = None   # phrase used inside the per-error detail list
+    table_color: str = RED     # colour of the status cell in -v output
+    notes_color: str = None    # colour of the notes cell (None = leave plain)
+    warning: str = None        # non-detailed warning line, {n} = count
+    fix_hint: str = None       # status-specific remediation block
+
+
+SKILL_STATUSES = (
+    SkillStatus("OPTIMAL", KIND_OK, "optimal_skills", "optimal_count", "optimal",
+                table_color=GREEN),
+    SkillStatus("MODERATE", KIND_OK, "moderate_skills", "moderate_count", "moderate",
+                table_color=YELLOW),
+    SkillStatus("BLOAT_RISK", KIND_RISK, "bloat_risks", "bloat_risks_count", "bloat risks",
+                warning="↳ ⚠️  {n} monolithic skill(s) exceeding 1,000 tokens!"),
+    # Error statuses are aggregated in the breakdown line, hence the shared
+    # label; detail_label is what shows up inside the brackets.
+    SkillStatus("BROKEN", KIND_ERROR, "broken_symlinks", "broken_count", "errors",
+                detail_label="broken", notes_color=RED,
+                warning="↳ ⚠️  {n} broken symlink(s) detected!"),
+    SkillStatus("UNREADABLE", KIND_ERROR, "unreadable_count", "unreadable_count", "errors",
+                detail_label="unreadable", notes_color=RED,
+                warning="↳ ⚠️  {n} unreadable file(s)!"),
+    SkillStatus("NO_ENTRYPOINT", KIND_ERROR, "no_entry_count", "no_entry_count", "errors",
+                detail_label="missing entry", notes_color=RED,
+                warning="↳ ⚠️  {n} missing entrypoint(s)!"),
+    SkillStatus("CRITICAL", KIND_ERROR, "critical_count", "critical_count", "errors",
+                detail_label="missing dispatcher", notes_color=RED,
+                warning="↳ ⚠️  {n} critical dispatcher failure(s)!",
+                fix_hint="missing_dispatcher"),
+)
+STATUS_BY_NAME = {status.name: status for status in SKILL_STATUSES}
+
+# Problem statuses, most severe kind first (stable within a kind). Drives the
+# warning block, badge precedence and remediation hints.
+PROBLEM_STATUSES = tuple(sorted(
+    (status for status in SKILL_STATUSES if KIND_BY_NAME[status.kind].is_problem),
+    key=lambda status: KIND_SEVERITY[status.kind],
+))
+
+FIX_HINTS = {
+    "broken_links": (
+        "  • Broken symlinks / Missing entrypoints:",
+        "    [CAUTION: Verify before deleting] To clean broken symlinks across all apps:",
+        "    find ~/.cursor ~/.codeium ~/.reasonix ~/.grok ~/.gemini ~/.kimi-code -xtype l -delete",
+        "    Ensure every skill directory contains a valid SKILL.md or README.md.",
+    ),
+    "missing_dispatcher": (
+        "  • Missing Dispatchers:",
+        "    Ensure every hollow shell skill has its referenced `references/00_dispatcher.md` file present.",
+    ),
+    "hollow_shell": (
+        "  • Monolithic Bloat Risks (>1000 tokens):",
+        "    Apply the Hollow Shell pattern:",
+        "    - Relocate instructional body to `references/00_dispatcher.md`",
+        "    - Keep root `SKILL.md` under 150 tokens with frontmatter + dispatcher reference.",
+    ),
+}
+
+
+def empty_status_counts() -> dict:
+    """Fresh zeroed counter block, keyed by summary_key in registry order."""
+    return {status.summary_key: 0 for status in SKILL_STATUSES}
+
+
+def tally_statuses(entries, counts: dict) -> None:
+    """Increment a counter block from audited entries (unknown statuses ignored)."""
+    for entry in entries:
+        status = STATUS_BY_NAME.get(entry["status"])
+        if status is not None:
+            counts[status.summary_key] += 1
+
+
+def count_by_kind(counts: dict, kind: str) -> int:
+    return sum(counts[status.summary_key] for status in SKILL_STATUSES if status.kind == kind)
+
+
+def worst_problem(counts: dict):
+    """Highest-severity non-zero kind present, as (kind, count) or (None, 0)."""
+    for kind in STATUS_KINDS:
+        if not kind.is_problem:
+            continue
+        total = count_by_kind(counts, kind.name)
+        if total:
+            return kind, total
+    return None, 0
+
+
+def status_color(status_name: str, default: str = RED) -> str:
+    status = STATUS_BY_NAME.get(status_name)
+    return status.table_color if status else default
+
+
+def status_notes_color(status_name: str):
+    status = STATUS_BY_NAME.get(status_name)
+    return status.notes_color if status else None
+
+
+def zero_problems_sentence() -> str:
+    """e.g. 'Zero errors, zero bloat risks.' — derived from kinds, not literals."""
+    phrases = [f"zero {kind.label}" for kind in STATUS_KINDS if kind.is_problem]
+    if not phrases:
+        return "Zero issues."
+    return ", ".join([phrases[0].capitalize()] + phrases[1:]) + "."
+
 
 def parse_frontmatter(content: str):
     clean = content.lstrip("\ufeff\n\r ")
     match = FRONTMATTER_RE.match(clean)
     if not match:
         return None, None
-    
+
     raw_yaml = match.group(1)
     if HAS_YAML:
         try:
@@ -121,6 +295,12 @@ def parse_frontmatter(content: str):
         return name, desc
 
     return None, None
+
+def read_text_capped(path: Path) -> str:
+    """Read a text file, hard-capped at MAX_READ_BYTES to prevent OOM."""
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        return f.read(MAX_READ_BYTES)
+
 
 def audit_skill_entry(entry_path: Path):
     is_link = entry_path.is_symlink()
@@ -179,9 +359,7 @@ def audit_skill_entry(entry_path: Path):
         file_size = 0
 
     try:
-        # Prevent OOM by reading max 5MB
-        with target_file.open("r", encoding="utf-8", errors="replace") as f:
-            content = f.read(5 * 1024 * 1024)
+        content = read_text_capped(target_file)
     except Exception as e:
         return {
             "name": entry_path.name,
@@ -274,77 +452,76 @@ def audit_directory(dir_path: str):
         results.append(res)
     return results
 
+
+# ---------------------------------------------------------------------------
+# Workspace rule auditing
+#
+# Every rule file — root candidate or recursive glob match — goes through
+# measure_rule_file(), so the OOM cap, the token count, the status thresholds
+# and the UNREADABLE fallback live in exactly one place.
+# ---------------------------------------------------------------------------
+
+def measure_rule_file(rule_file: Path, name: str, error_name: str = None) -> dict:
+    """Read + tokenise one workspace rule file, degrading to UNREADABLE."""
+    error_name = error_name or name
+    try:
+        file_size = rule_file.stat().st_size
+        content = read_text_capped(rule_file)
+        tokens = count_tokens(content)
+        status = "OPTIMAL" if tokens < WORKSPACE_BLOAT_LIMIT else "BLOAT_RISK"
+        return {
+            "name": name,
+            "path": str(rule_file),
+            "status": status,
+            "tokens": tokens,
+            "size": file_size,
+        }
+    except Exception as e:
+        return {
+            "name": error_name,
+            "path": str(rule_file),
+            "status": "UNREADABLE",
+            "tokens": 0,
+            "size": 0,
+            "error": str(e),
+        }
+
+
+def workspace_display_name(rule_file: Path, ws_path: Path) -> str:
+    """Workspace-relative label, falling back to the bare file name."""
+    try:
+        return str(rule_file.relative_to(ws_path))
+    except Exception:
+        return rule_file.name
+
+
 def audit_workspace(ws_path: Path):
     if not ws_path.exists() or not ws_path.is_dir():
         return []
 
-    candidates = [
-        "AGENTS.md", 
-        "CLAUDE.md", 
-        "GEMINI.md", 
-        ".cursorrules", 
-        ".windsurfrules",
-        ".github/copilot-instructions.md"
-    ]
     found = []
-    
+
     # Check root and candidate files
-    for cand in candidates:
+    for cand in WORKSPACE_RULE_FILES:
         cf = ws_path / cand
         if cf.is_file():
-            try:
-                file_size = cf.stat().st_size
-                with cf.open("r", encoding="utf-8", errors="replace") as f:
-                    content = f.read(5 * 1024 * 1024)
-                tokens = count_tokens(content)
-                status = "OPTIMAL" if tokens < 1000 else "BLOAT_RISK"
-                found.append({
-                    "name": cand,
-                    "path": str(cf),
-                    "status": status,
-                    "tokens": tokens,
-                    "size": file_size,
-                })
-            except Exception as e:
-                found.append({
-                    "name": cand,
-                    "path": str(cf),
-                    "status": "UNREADABLE",
-                    "tokens": 0,
-                    "size": 0,
-                    "error": str(e),
-                })
-                
-    # Check .cursor/rules/**/*.mdc recursively
-    cursor_rules_dir = ws_path / ".cursor" / "rules"
-    if cursor_rules_dir.is_dir():
+            found.append(measure_rule_file(cf, name=cand))
+
+    # Check recursive rule sets (e.g. .cursor/rules/**/*.mdc)
+    for rel_dir, pattern in WORKSPACE_RULE_GLOBS:
+        rules_dir = ws_path / rel_dir
+        if not rules_dir.is_dir():
+            continue
         try:
-            for rule_file in sorted(cursor_rules_dir.rglob("*.mdc")):
-                try:
-                    rel_name = rule_file.relative_to(ws_path)
-                    file_size = rule_file.stat().st_size
-                    with rule_file.open("r", encoding="utf-8", errors="replace") as f:
-                        content = f.read(5 * 1024 * 1024)
-                    tokens = count_tokens(content)
-                    status = "OPTIMAL" if tokens < 1000 else "BLOAT_RISK"
-                    found.append({
-                        "name": str(rel_name),
-                        "path": str(rule_file),
-                        "status": status,
-                        "tokens": tokens,
-                        "size": file_size,
-                    })
-                except Exception as e:
-                    found.append({
-                        "name": str(rule_file.name),
-                        "path": str(rule_file),
-                        "status": "UNREADABLE",
-                        "tokens": 0,
-                        "size": 0,
-                        "error": str(e),
-                    })
+            rule_files = sorted(rules_dir.rglob(pattern))
         except Exception:
-            pass
+            continue
+        for rule_file in rule_files:
+            found.append(measure_rule_file(
+                rule_file,
+                name=workspace_display_name(rule_file, ws_path),
+                error_name=rule_file.name,
+            ))
 
     return found
 
@@ -380,13 +557,7 @@ def main():
         "workspace": None,
         "summary": {
             "total_skills_detected": 0,
-            "optimal_skills": 0,
-            "moderate_skills": 0,
-            "bloat_risks": 0,
-            "broken_symlinks": 0,
-            "unreadable_count": 0,
-            "no_entry_count": 0,
-            "critical_count": 0,
+            **empty_status_counts(),
         }
     }
 
@@ -405,60 +576,38 @@ def main():
             }
             continue
 
-        total_prog = sum(s["progressive_tokens"] for s in app_skills)
-        total_brute = sum(s["bruteforce_tokens"] for s in app_skills)
-        
-        optimal = sum(1 for s in app_skills if s["status"] == "OPTIMAL")
-        moderate = sum(1 for s in app_skills if s["status"] == "MODERATE")
-        risks = sum(1 for s in app_skills if s["status"] == "BLOAT_RISK")
-        broken = sum(1 for s in app_skills if s["status"] == "BROKEN")
-        unreadable = sum(1 for s in app_skills if s["status"] == "UNREADABLE")
-        no_entry = sum(1 for s in app_skills if s["status"] == "NO_ENTRYPOINT")
-        critical = sum(1 for s in app_skills if s["status"] == "CRITICAL")
+        counts = empty_status_counts()
+        tally_statuses(app_skills, counts)
 
-        overall_report["summary"]["total_skills_detected"] += len(app_skills)
-        overall_report["summary"]["optimal_skills"] += optimal
-        overall_report["summary"]["moderate_skills"] += moderate
-        overall_report["summary"]["bloat_risks"] += risks
-        overall_report["summary"]["broken_symlinks"] += broken
-        overall_report["summary"]["unreadable_count"] += unreadable
-        overall_report["summary"]["no_entry_count"] += no_entry
-        overall_report["summary"]["critical_count"] += critical
-
-        overall_report["apps"][app["name"]] = {
+        app_report = {
             "installed": True,
             "type": app["type"],
             "paths": app["paths"],
             "skills_count": len(app_skills),
-            "progressive_tokens": total_prog,
-            "bruteforce_tokens": total_brute,
-            "optimal_count": optimal,
-            "moderate_count": moderate,
-            "bloat_risks_count": risks,
-            "broken_count": broken,
-            "unreadable_count": unreadable,
-            "no_entry_count": no_entry,
-            "critical_count": critical,
-            "skills": app_skills,
+            "progressive_tokens": sum(s["progressive_tokens"] for s in app_skills),
+            "bruteforce_tokens": sum(s["bruteforce_tokens"] for s in app_skills),
         }
+        app_report.update({status.app_key: counts[status.summary_key] for status in SKILL_STATUSES})
+        app_report["skills"] = app_skills
+        overall_report["apps"][app["name"]] = app_report
+
+        summary = overall_report["summary"]
+        summary["total_skills_detected"] += len(app_skills)
+        for status in SKILL_STATUSES:
+            summary[status.summary_key] += counts[status.summary_key]
+
+    summary = overall_report["summary"]
 
     # Verify reconciliation assertion
-    s = overall_report["summary"]
-    assert s["total_skills_detected"] == (
-        s["optimal_skills"] + 
-        s["moderate_skills"] + 
-        s["bloat_risks"] + 
-        s["broken_symlinks"] + 
-        s["unreadable_count"] + 
-        s["no_entry_count"] + 
-        s["critical_count"]
+    assert summary["total_skills_detected"] == sum(
+        summary[status.summary_key] for status in SKILL_STATUSES
     ), "Accounting inconsistency detected in summary calculation!"
 
     if args.workspace or args.workspace_path:
         target_ws = Path(args.workspace_path) if args.workspace_path else Path.cwd()
         overall_report["workspace"] = audit_workspace(target_ws)
 
-    total_errors = s['broken_symlinks'] + s['unreadable_count'] + s['no_entry_count'] + s['critical_count']
+    total_errors = count_by_kind(summary, KIND_ERROR)
 
     if args.json:
         print(json.dumps(overall_report, indent=2))
@@ -471,23 +620,16 @@ def main():
             print(colorize(f"[{app_name}] Not found or no skills configured in default paths.", DIM))
             continue
 
-        count = data["skills_count"]
-        broken = data.get("broken_count", 0)
-        unreadable = data.get("unreadable_count", 0)
-        no_entry = data.get("no_entry_count", 0)
-        critical = data.get("critical_count", 0)
-        risks = data.get("bloat_risks_count", 0)
+        app_counts = {status.summary_key: data.get(status.app_key, 0) for status in SKILL_STATUSES}
 
-        errors = broken + unreadable + no_entry + critical
-        
-        if errors > 0:
-            status_badge = colorize(f"CRITICAL ({errors} Errors/Broken)", RED)
-        elif risks > 0:
-            status_badge = colorize(f"WARNING ({risks} Bloat Risks)", YELLOW)
+        badge_kind, badge_count = worst_problem(app_counts)
+        if badge_kind is None:
+            ok_kind = KIND_BY_NAME[KIND_OK]
+            status_badge = colorize(ok_kind.badge, ok_kind.color)
         else:
-            status_badge = colorize("OPTIMAL (Protected)", GREEN)
+            status_badge = colorize(badge_kind.badge.format(n=badge_count), badge_kind.color)
 
-        print(f"{bold('● ' + app_name)} ({count} skills installed) -> {status_badge}")
+        print(f"{bold('● ' + app_name)} ({data['skills_count']} skills installed) -> {status_badge}")
         print(f"  {colorize('Paths:', DIM)} {', '.join(data['paths'])}")
         print(f"  {colorize('Progressive Disclosure Index:', CYAN)} {data['progressive_tokens']:,} tokens {colorize('(Initial metadata injection)', DIM)}")
         print(f"  {colorize('Brute-Force Injected Load:', MAGENTA)}    {data['bruteforce_tokens']:,} tokens {colorize('(Worst-case naive full load)', DIM)}")
@@ -497,18 +639,13 @@ def main():
             print(f"  {colorize('-'*75, DIM)}")
             for s_entry in data["skills"]:
                 st = s_entry["status"]
-                st_str = f"{st:<15}"
-                if st == "OPTIMAL":
-                    st_col = colorize(st_str, GREEN)
-                elif st == "MODERATE":
-                    st_col = colorize(st_str, YELLOW)
-                else:
-                    st_col = colorize(st_str, RED)
-                
+                st_col = colorize(f"{st:<15}", status_color(st))
+
                 tok_str = f"{s_entry['bruteforce_tokens']:,}"
                 notes = s_entry["notes"]
-                if s_entry["status"] in ("BROKEN", "UNREADABLE", "NO_ENTRYPOINT", "CRITICAL"):
-                    notes_display = colorize(f"{notes[:45]}", RED)
+                notes_color = status_notes_color(st)
+                if notes_color:
+                    notes_display = colorize(f"{notes[:45]}", notes_color)
                 elif s_entry["is_link"] and s_entry["target"]:
                     notes_display = f"{colorize('-> ' + s_entry['target'][:35] + '...', DIM)}"
                 else:
@@ -516,16 +653,10 @@ def main():
                 print(f"  {s_entry['name'][:30]:<32} {st_col} {tok_str:<10} {notes_display}")
             print()
         else:
-            if broken > 0:
-                print(f"  {colorize(f'↳ ⚠️  {broken} broken symlink(s) detected!', RED)}")
-            if unreadable > 0:
-                print(f"  {colorize(f'↳ ⚠️  {unreadable} unreadable file(s)!', RED)}")
-            if no_entry > 0:
-                print(f"  {colorize(f'↳ ⚠️  {no_entry} missing entrypoint(s)!', RED)}")
-            if critical > 0:
-                print(f"  {colorize(f'↳ ⚠️  {critical} critical dispatcher failure(s)!', RED)}")
-            if risks > 0:
-                print(f"  {colorize(f'↳ ⚠️  {risks} monolithic skill(s) exceeding 1,000 tokens!', YELLOW)}")
+            for status in PROBLEM_STATUSES:
+                count = app_counts[status.summary_key]
+                if count > 0 and status.warning:
+                    print(f"  {colorize(status.warning.format(n=count), KIND_BY_NAME[status.kind].color)}")
         print()
 
     # Workspace report if requested
@@ -538,34 +669,51 @@ def main():
         else:
             for wf in ws_files:
                 st = wf["status"]
-                st_col = colorize(f"{st:<12}", GREEN if st == "OPTIMAL" else RED)
+                st_col = colorize(f"{st:<12}", status_color(st))
                 tok_str = f"{wf.get('tokens', 0):,} tokens"
                 print(f"  {wf['name']:<32} {st_col} {tok_str:<12} {wf['path']}")
         print()
 
     print(bold("-------------------------------------------------------------"))
-    print(f"{bold('Summary:')} {s['total_skills_detected']} total skills scanned across active apps.")
-    
-    if total_errors == 0 and s["bloat_risks"] == 0:
-        print(f"{bold(colorize('✓ ALL SYSTEMS OPTIMAL:', GREEN))} {s['optimal_skills']} optimal, {s['moderate_skills']} moderate. Zero errors, zero bloat risks.")
+    print(f"{bold('Summary:')} {summary['total_skills_detected']} total skills scanned across active apps.")
+
+    worst_kind, _ = worst_problem(summary)
+    if worst_kind is None:
+        ok_detail = ", ".join(
+            f"{summary[status.summary_key]} {status.label}"
+            for status in SKILL_STATUSES if status.kind == KIND_OK
+        )
+        print(f"{bold(colorize('✓ ALL SYSTEMS OPTIMAL:', GREEN))} {ok_detail}. {zero_problems_sentence()}")
     else:
-        print(f"{colorize('Audit Breakdown:', YELLOW)} {s['optimal_skills']} optimal, {s['moderate_skills']} moderate, {s['bloat_risks']} bloat risks, {total_errors} errors ({s['broken_symlinks']} broken, {s['unreadable_count']} unreadable, {s['no_entry_count']} missing entry, {s['critical_count']} missing dispatcher).")
+        inline_detail = ", ".join(
+            f"{summary[status.summary_key]} {status.label}"
+            for status in SKILL_STATUSES if status.kind != KIND_ERROR
+        )
+        error_detail = ", ".join(
+            f"{summary[status.summary_key]} {status.detail_label}"
+            for status in SKILL_STATUSES if status.kind == KIND_ERROR
+        )
+        error_label = KIND_BY_NAME[KIND_ERROR].label
+        print(f"{colorize('Audit Breakdown:', YELLOW)} {inline_detail}, {total_errors} {error_label} ({error_detail}).")
 
     if args.fix_hints:
         print(f"\n{bold(colorize('Fix Suggestions & Remediation:', CYAN))}")
-        if total_errors > 0:
-            print("  • Broken symlinks / Missing entrypoints:")
-            print("    [CAUTION: Verify before deleting] To clean broken symlinks across all apps:")
-            print("    find ~/.cursor ~/.codeium ~/.reasonix ~/.grok ~/.gemini ~/.kimi-code -xtype l -delete")
-            print("    Ensure every skill directory contains a valid SKILL.md or README.md.")
-        if s["critical_count"] > 0:
-            print("  • Missing Dispatchers:")
-            print("    Ensure every hollow shell skill has its referenced `references/00_dispatcher.md` file present.")
-        if s["bloat_risks"] > 0:
-            print("  • Monolithic Bloat Risks (>1000 tokens):")
-            print("    Apply the Hollow Shell pattern:")
-            print("    - Relocate instructional body to `references/00_dispatcher.md`")
-            print("    - Keep root `SKILL.md` under 150 tokens with frontmatter + dispatcher reference.")
+        printed_hints = set()
+        for kind in STATUS_KINDS:
+            if not kind.is_problem:
+                continue
+            # Kind-wide remediation first, then any status-specific block.
+            hint_targets = [(kind.fix_hint, count_by_kind(summary, kind.name))]
+            hint_targets += [
+                (status.fix_hint, summary[status.summary_key])
+                for status in SKILL_STATUSES if status.kind == kind.name
+            ]
+            for hint_id, count in hint_targets:
+                if not hint_id or count <= 0 or hint_id in printed_hints:
+                    continue
+                printed_hints.add(hint_id)
+                for line in FIX_HINTS[hint_id]:
+                    print(line)
 
     print(f"{colorize('Use ai-context-audit -v for per-skill inspection, or --json for programmatic output.', DIM)}\n")
 
