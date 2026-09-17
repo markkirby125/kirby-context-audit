@@ -58,6 +58,25 @@ def bold(text: str) -> str:
 # OOM guard: never pull more than this much of a single file into memory.
 MAX_READ_BYTES = 5 * 1024 * 1024
 
+# Hollow Shell signature detection.
+#
+# A hollow shell declares its dispatcher reference in the header region of the
+# entrypoint. Matching those markers anywhere in the body lets a byte-heavy
+# monolithic skill "mask" itself as hollow — it only has to mention the
+# dispatcher pattern in a later section to be reclassified as OPTIMAL, hiding
+# real bloat. So the signature is only honoured inside the first
+# HOLLOW_SIG_HEAD_LINES lines, except for files already too small to be a
+# bloat risk (< HOLLOW_SIG_TOKEN_FLOOR tokens), which may match anywhere.
+HOLLOW_SIG_HEAD_LINES = 15
+HOLLOW_SIG_TOKEN_FLOOR = 1000
+
+HOLLOW_SIG_MARKERS = (
+    "references/00_dispatcher.md",
+    "references/dispatcher.md",
+    "To execute this skill, you MUST first read",
+    "read the dispatcher instructions",
+)
+
 APP_TARGETS = [
     {
         "name": "Antigravity",
@@ -206,8 +225,14 @@ PROBLEM_STATUSES = tuple(sorted(
 FIX_HINTS = {
     "broken_links": (
         "  • Broken symlinks / Missing entrypoints:",
-        "    [CAUTION: Verify before deleting] To clean broken symlinks across all apps:",
-        "    find ~/.cursor ~/.codeium ~/.reasonix ~/.grok ~/.gemini ~/.kimi-code -xtype l -delete",
+        "    Do NOT bulk-delete. A broken link is often a moved repository — a re-link, not a loss.",
+        "    1. Inspect first (read-only; changes nothing):",
+        "       find ~/.cursor ~/.codeium ~/.reasonix ~/.grok ~/.gemini ~/.kimi-code -xtype l",
+        "    2. For each candidate, resolve its intended target and look for it elsewhere:",
+        "       readlink -f <link>   # then search the filesystem for that name before deleting",
+        "    3. Act on one reviewed entry at a time — repair by re-pointing, or remove the link itself:",
+        "       ln -sfn <verified-target> <link>   # repair",
+        "       rm <link>                          # delete the symlink only (never `rm -r` a path under ~)",
         "    Ensure every skill directory contains a valid SKILL.md or README.md.",
     ),
     "missing_dispatcher": (
@@ -297,9 +322,76 @@ def parse_frontmatter(content: str):
     return None, None
 
 def read_text_capped(path: Path) -> str:
-    """Read a text file, hard-capped at MAX_READ_BYTES to prevent OOM."""
-    with path.open("r", encoding="utf-8", errors="replace") as f:
-        return f.read(MAX_READ_BYTES)
+    """Read a text file, hard-capped at MAX_READ_BYTES to prevent OOM.
+
+    The cap is applied to *bytes* read in binary mode. Opening in text mode and
+    calling read(n) counts characters, so a multi-byte UTF-8 (or adversarially
+    encoded) file can still pull a multiple of MAX_READ_BYTES into memory.
+    """
+    with open(path, "rb") as f:
+        content = f.read(MAX_READ_BYTES)
+    return content.decode("utf-8", "replace")
+
+
+def has_hollow_signature(content: str, bruteforce_tokens: int) -> bool:
+    """Is the Hollow Shell signature present in the entrypoint header region?
+
+    Only the first HOLLOW_SIG_HEAD_LINES lines are inspected unless the file is
+    already below HOLLOW_SIG_TOKEN_FLOOR tokens (and therefore cannot be a
+    bloat risk). See the constants block above for the rationale.
+    """
+    if bruteforce_tokens < HOLLOW_SIG_TOKEN_FLOOR:
+        region = content
+    else:
+        region = "\n".join(content.splitlines()[:HOLLOW_SIG_HEAD_LINES])
+    return any(marker in region for marker in HOLLOW_SIG_MARKERS)
+
+
+# ---------------------------------------------------------------------------
+# Canonical-path memoisation
+#
+# Symlink farms mean the same physical skill file is reachable from several app
+# roots and several search paths within one app. Reading and tokenising it once
+# per canonical file keeps a full audit from re-reading (and re-tokenising)
+# identical bytes over and over.
+# ---------------------------------------------------------------------------
+
+_ANALYSIS_CACHE = {}
+
+
+def canonical_path(path: Path) -> str:
+    """Best-effort canonical identity for a path, with symlinks fully resolved."""
+    try:
+        return os.path.realpath(str(path))
+    except (OSError, ValueError):
+        return str(path)
+
+
+def _tokenize_capped(target_file: Path) -> dict:
+    """Read one file once and derive every content-derived metric."""
+    content = read_text_capped(target_file)
+    bruteforce_tokens = count_tokens(content)
+    name, desc = parse_frontmatter(content)
+    return {
+        "bruteforce_tokens": bruteforce_tokens,
+        "is_hollow_sig": has_hollow_signature(content, bruteforce_tokens),
+        "frontmatter_name": name,
+        "description": desc,
+    }
+
+
+def analyze_file(target_file: Path) -> dict:
+    """Memoised read + tokenise of one canonical file.
+
+    Raises on read failure; failures are deliberately not cached so a transient
+    error is retried rather than remembered for the rest of the run.
+    """
+    key = canonical_path(target_file)
+    cached = _ANALYSIS_CACHE.get(key)
+    if cached is None:
+        cached = _tokenize_capped(target_file)
+        _ANALYSIS_CACHE[key] = cached
+    return cached
 
 
 def audit_skill_entry(entry_path: Path):
@@ -359,7 +451,7 @@ def audit_skill_entry(entry_path: Path):
         file_size = 0
 
     try:
-        content = read_text_capped(target_file)
+        analysis = analyze_file(target_file)
     except Exception as e:
         return {
             "name": entry_path.name,
@@ -375,15 +467,10 @@ def audit_skill_entry(entry_path: Path):
             "notes": f"Read error: {e}",
         }
 
-    bruteforce_tokens = count_tokens(content)
-
-    # Hollow shell signature check
-    has_hollow_sig = bool(
-        "references/00_dispatcher.md" in content or
-        "references/dispatcher.md" in content or
-        "To execute this skill, you MUST first read" in content or
-        "read the dispatcher instructions" in content
-    )
+    # Content-derived metrics come from the canonical-path memo, so an entry
+    # reached through several app roots is read and tokenised exactly once.
+    bruteforce_tokens = analysis["bruteforce_tokens"]
+    has_hollow_sig = analysis["is_hollow_sig"]
 
     is_hollow = False
     dispatcher_missing = False
@@ -397,7 +484,7 @@ def audit_skill_entry(entry_path: Path):
         else:
             dispatcher_missing = True
 
-    name, desc = parse_frontmatter(content)
+    name, desc = analysis["frontmatter_name"], analysis["description"]
     if not name:
         name = entry_path.name
 
@@ -451,6 +538,30 @@ def audit_directory(dir_path: str):
         res = audit_skill_entry(entry)
         results.append(res)
     return results
+
+
+def collect_app_skills(app: dict) -> list:
+    """Audit every configured path for one app, de-duplicated by canonical path.
+
+    Apps may list overlapping roots — Cursor ships both ~/.cursor/skills and
+    ~/.cursor/skills-cursor, and every root here is effectively a symlink farm
+    pointing at the same physical skill directories. Without canonical
+    de-duplication the same skill is counted once per root it is reachable
+    from, inflating both the skill count and the summed token totals.
+    """
+    skills = []
+    seen = set()
+    for path_str in app["paths"]:
+        dir_res = audit_directory(path_str)
+        if dir_res is None:
+            continue
+        for entry in dir_res:
+            key = canonical_path(Path(entry["path"]))
+            if key in seen:
+                continue
+            seen.add(key)
+            skills.append(entry)
+    return skills
 
 
 # ---------------------------------------------------------------------------
@@ -562,11 +673,7 @@ def main():
     }
 
     for app in matched_targets:
-        app_skills = []
-        for path_str in app["paths"]:
-            dir_res = audit_directory(path_str)
-            if dir_res is not None:
-                app_skills.extend(dir_res)
+        app_skills = collect_app_skills(app)
 
         if not app_skills:
             overall_report["apps"][app["name"]] = {
