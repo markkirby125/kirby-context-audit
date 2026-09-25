@@ -1,6 +1,6 @@
 ---
 name: kirby-context-audit
-description: "Cross-IDE AI coding agent context bloat, token burn, and skill health auditor. Use when auditing prompt overhead, token consumption, broken skill symlinks, or monolithic context hazards across Antigravity, Cursor, Windsurf, Grok, Kimi, and Reasonix."
+description: "Cross-IDE AI coding agent context bloat, token burn, and skill health auditor. Use when auditing prompt overhead, token consumption, broken skill symlinks, or monolithic context hazards across Antigravity, Cursor, Windsurf, Grok, Kimi, Reasonix, Claude Code, and zCode CLI."
 category: technique
 triggers: [context bloat, token burn, audit context, audit skills, check context, ai-context-audit, context size, system prompt size, kirby-context-audit]
 ---

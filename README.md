@@ -2,11 +2,11 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python: 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
-[![Cross-IDE: Antigravity | Cursor | Windsurf | Grok | Kimi | Reasonix](https://img.shields.io/badge/IDEs-Antigravity%20%7C%20Cursor%20%7C%20Windsurf%20%7C%20Grok%20%7C%20Kimi%20%7C%20Reasonix-brightgreen.svg)](#supported-ecosystems)
+[![Cross-IDE: Antigravity | Cursor | Windsurf | Grok | Kimi | Reasonix | Claude Code | zCode](https://img.shields.io/badge/IDEs-Antigravity%20%7C%20Cursor%20%7C%20Windsurf%20%7C%20Grok%20%7C%20Kimi%20%7C%20Reasonix%20%7C%20Claude%20Code%20%7C%20zCode-brightgreen.svg)](#supported-ecosystems)
 
 **Cross-IDE AI coding agent context bloat, token burn, and skill health auditor.**
 
-`ai-context-audit` inspects your global and workspace agent skills across **Antigravity, Cursor, Windsurf, Grok, Kimi Code, and Reasonix**. It detects silent prompt bloat, flags monolithic skills, verifies symlink integrity, and measures the token tax imposed on your LLM queries.
+`ai-context-audit` inspects your global and workspace agent skills across **Antigravity, Cursor, Windsurf, Grok, Kimi Code, Reasonix, Claude Code, and zCode CLI**. It detects silent prompt bloat, flags monolithic skills, verifies symlink integrity, and measures the token tax imposed on your LLM queries.
 
 ---
 
@@ -95,6 +95,12 @@ ln -sf "$(pwd)/kirby-context-audit" ~/.grok/skills/kirby-context-audit
 
 # For Reasonix
 ln -sf "$(pwd)/kirby-context-audit" ~/.reasonix/skills/kirby-context-audit
+
+# For Claude Code
+ln -sf "$(pwd)/kirby-context-audit" ~/.claude/skills/kirby-context-audit
+
+# For zCode CLI
+ln -sf "$(pwd)/kirby-context-audit" ~/.zcode/skills/kirby-context-audit
 ```
 
 ---
@@ -128,7 +134,7 @@ ai-context-audit --workspace
 # Audit a specific project workspace
 ai-context-audit --workspace-path /path/to/project
 ```
-Scans `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `.cursorrules`, `.windsurfrules`, `.github/copilot-instructions.md`, and all recursive `.cursor/rules/**/*.mdc` files.
+Scans `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `ZCODE.md`, `.cursorrules`, `.windsurfrules`, `.github/copilot-instructions.md`, and all recursive `.cursor/rules/**/*.mdc` files.
 
 ### 5. Automated Remediation Hints
 ```bash
@@ -175,6 +181,8 @@ my-agent-skill/
 | **Grok** | `~/.grok/skills` | Progressive Disclosure |
 | **Kimi Code** | `~/.kimi-code/skills` | Progressive Disclosure |
 | **Reasonix** | `~/.reasonix/skills` | Progressive Disclosure |
+| **Claude Code** | `~/.claude/skills` | Hybrid |
+| **zCode CLI** | `~/.zcode/skills` | Progressive Disclosure |
 
 ---
 

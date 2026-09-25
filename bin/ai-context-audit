@@ -2,7 +2,8 @@
 """
 ai-context-audit: Cross-IDE AI Coding Agent Context Bloat & Skill Health Auditor
 Scans global and workspace configurations across Antigravity, Cursor, Windsurf,
-Grok, Kimi, and Reasonix to detect context bloat, token burn, and broken symlinks.
+Grok, Kimi, Reasonix, Claude Code, and zCode CLI to detect context bloat, token
+burn, and broken symlinks.
 """
 
 import os
@@ -114,6 +115,18 @@ APP_TARGETS = [
         "type": "progressive",
         "paths": [os.path.expanduser("~/.reasonix/skills")],
     },
+    {
+        "name": "Claude Code",
+        "cli_name": "claude",
+        "type": "hybrid",
+        "paths": [os.path.expanduser("~/.claude/skills")],
+    },
+    {
+        "name": "zCode CLI",
+        "cli_name": "zcode",
+        "type": "progressive",
+        "paths": [os.path.expanduser("~/.zcode/skills")],
+    },
 ]
 
 # Workspace-wide instruction files, looked up directly in the workspace root.
@@ -121,6 +134,7 @@ WORKSPACE_RULE_FILES = (
     "AGENTS.md",
     "CLAUDE.md",
     "GEMINI.md",
+    "ZCODE.md",
     ".cursorrules",
     ".windsurfrules",
     ".github/copilot-instructions.md",
@@ -227,7 +241,7 @@ FIX_HINTS = {
         "  • Broken symlinks / Missing entrypoints:",
         "    Do NOT bulk-delete. A broken link is often a moved repository — a re-link, not a loss.",
         "    1. Inspect first (read-only; changes nothing):",
-        "       find ~/.cursor ~/.codeium ~/.reasonix ~/.grok ~/.gemini ~/.kimi-code -xtype l",
+        "       find ~/.cursor ~/.codeium ~/.reasonix ~/.grok ~/.gemini ~/.kimi-code ~/.claude ~/.zcode -xtype l",
         "    2. For each candidate, resolve its intended target and look for it elsewhere:",
         "       readlink -f <link>   # then search the filesystem for that name before deleting",
         "    3. Act on one reviewed entry at a time — repair by re-pointing, or remove the link itself:",
