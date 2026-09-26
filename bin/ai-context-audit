@@ -78,6 +78,14 @@ HOLLOW_SIG_MARKERS = (
     "read the dispatcher instructions",
 )
 
+IGNORED_SKILL_DIRS = {
+    "synced",
+    "node_modules",
+    "__pycache__",
+    ".git",
+}
+
+
 APP_TARGETS = [
     {
         "name": "Antigravity",
@@ -547,7 +555,7 @@ def audit_directory(dir_path: str):
         return None
 
     for entry in entries:
-        if entry.name.startswith("."):
+        if entry.name.startswith(".") or entry.name in IGNORED_SKILL_DIRS:
             continue
         res = audit_skill_entry(entry)
         results.append(res)
