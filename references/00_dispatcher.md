@@ -3,7 +3,7 @@
 ## Overview
 `kirby-context-audit` provides cross-IDE diagnostic scanning to protect AI coding agents against **system prompt context bloat**, **token burn**, and **broken skill configurations**.
 
-As developers install hundreds of agent skills and custom instructions across multiple IDEs (Antigravity, Cursor, Windsurf, Grok, Kimi Code, Reasonix, Claude Code, zCode CLI), naive environments inject full monolithic markdown files into the system prompt on *every turn*, devouring 50,000 to 300,000+ tokens before the user even types a prompt.
+As developers install hundreds of agent skills and custom instructions across multiple IDEs (Antigravity, Cursor, Windsurf, Grok, Kimi Code, Reasonix, Claude Code, zCode CLI, OpenCode, Codex, Qwen Code, Aider, Augment, Continue, Roo Code, Kiro, Factory, and Trae), naive environments inject full monolithic markdown files into the system prompt on *every turn*, devouring 50,000 to 300,000+ tokens before the user even types a prompt.
 
 `ai-context-audit` scans all registered global and workspace configurations, calculates both the **Progressive Disclosure Load** (what smart agents like AGY or Kimi load) and the **Brute-Force Injected Load** (what naive agents like Cursor inject), and verifies the physical integrity of skill files and symlinks.
 
