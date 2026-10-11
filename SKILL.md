@@ -4,7 +4,7 @@ description: "Cross-IDE AI coding agent context bloat, token burn, and skill hea
 category: technique
 triggers: [context bloat, token burn, audit context, audit skills, check context, ai-context-audit, context size, system prompt size, kirby-context-audit]
 risk: unverified
-author: william-fitzpatrick
+author: paul-kirby
 tags: [kirby, ai-agent, workflow]
 ---
 
