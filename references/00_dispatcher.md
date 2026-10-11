@@ -65,3 +65,17 @@ If an audit reveals `BLOAT_RISK` skills, convert them to Hollow Shells:
      `references/00_dispatcher.md`
      ```
 3. **Verify**: Run `ai-context-audit -v` to ensure the skill status transitions from `BLOAT_RISK` to `OPTIMAL`.
+
+---
+
+## Smart Zone Verification Mode (kirby-pocock-workflow M3/M4)
+
+Invoked by `../../kirby-pocock-workflow/SKILL.md` Module 3 §3.5 (pre-queue ticket sizing) and Module 4 §4.1 (clean-head seeding) to verify that a ticket's context manifest stays within the Smart Zone token budget.
+
+**Procedure (per ticket):**
+1. Assemble the manifest's physical payload: the ticket brief + every file/doc it names (spec excerpts, glossary entries, acceptance criteria). Nothing imagined — measure what the builder will actually receive.
+2. Estimate tokens per artifact (words × 1.35 for prose; count code/JSON lines × ~10 tokens/line) and sum with the expected diff size estimate.
+3. Verdict: **PASS** — total ≤ 60% of the working context window (margin for reasoning, tool output, and drift); **SPLIT** — over 60%, regardless of fit. The 60% margin is the Smart Zone boundary, not the hard window ceiling.
+4. A SPLIT verdict is returned to `/to-tickets` with the largest artifact named — the ticket is re-decomposed and re-edged in the DAG; budgets are never recovered by trimming the manifest's citations (that starves the builder).
+
+**Scope guard:** this mode measures *documents handed to a builder*, distinct from this skill's core mission (installed-skill bloat across IDEs). Do not run `ai-context-audit` CLI scans for this mode — the manifests are ephemeral ticket artifacts, not installed skills.
