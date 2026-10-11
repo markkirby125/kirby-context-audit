@@ -6,6 +6,8 @@
 
 **Cross-IDE AI coding agent context bloat, token burn, and skill health auditor.**
 
+**October 2026 addition:** the Smart Zone Verification Mode — per-ticket context-manifest token budgeting (60%-of-window boundary, SPLIT verdicts naming the largest artifact) that gates ticket queueing in `kirby-pocock-workflow` Modules 3–4.
+
 `ai-context-audit` inspects your global and workspace agent skills across **18 AI coding apps**: Antigravity, Cursor, Windsurf, Grok, Kimi Code, Reasonix, Claude Code, zCode CLI, OpenCode, Codex, Qwen Code, Aider, Augment, Continue, Roo Code, Kiro, Factory, and Trae. It detects silent prompt bloat, flags monolithic skills, verifies symlink integrity, and measures the token tax imposed on your LLM queries.
 
 ---
