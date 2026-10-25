@@ -84,6 +84,11 @@ IGNORED_SKILL_DIRS = {
     "node_modules",
     "__pycache__",
     ".git",
+    # Containers of skills, not skills: each child is <name>/SKILL.md. ECC's
+    # continuous-learning hook runs `mkdir -p` on "learned" even when nothing
+    # has been learned, which used to surface as a NO_ENTRYPOINT error.
+    "learned",
+    "imported",
 }
 
 
@@ -612,6 +617,16 @@ def audit_skill_entry(entry_path: Path):
         "notes": notes,
     }
 
+def is_empty_dir(path: Path) -> bool:
+    """True for a directory with no entries at all. It holds nothing to audit,
+    so it is not a skill that is missing its entrypoint. A dead symlink is not
+    a directory, so it is still reported as BROKEN."""
+    try:
+        return path.is_dir() and not any(path.iterdir())
+    except OSError:
+        return False
+
+
 def audit_directory(dir_path: str):
     p = Path(dir_path)
     if not p.exists() or not p.is_dir():
@@ -625,6 +640,8 @@ def audit_directory(dir_path: str):
 
     for entry in entries:
         if entry.name.startswith(".") or entry.name in IGNORED_SKILL_DIRS:
+            continue
+        if is_empty_dir(entry):
             continue
         res = audit_skill_entry(entry)
         results.append(res)
