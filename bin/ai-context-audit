@@ -463,6 +463,23 @@ def canonical_path(path: Path) -> str:
         return str(path)
 
 
+# The kirby-skills repo root: this script lives at <repo>/kirby-context-audit/bin/.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def split_by_repo_scope(skills, repo_root: Path):
+    """Split audited entries into (inside repo_root, outside repo_root) by real path.
+
+    A symlink in an app folder counts as inside when its target is inside the repo.
+    """
+    prefix = str(repo_root) + os.sep
+    inside, outside = [], []
+    for entry in skills:
+        real = canonical_path(Path(entry["path"]))
+        (inside if real.startswith(prefix) else outside).append(entry)
+    return inside, outside
+
+
 def _tokenize_capped(target_file: Path) -> dict:
     """Read one file once and derive every content-derived metric."""
     content = read_text_capped(target_file)
@@ -752,6 +769,8 @@ def main():
     parser.add_argument("--workspace", action="store_true", help="Also audit the current workspace root for rule files.")
     parser.add_argument("--workspace-path", type=str, default=None, help="Custom directory path to audit for workspace rule files.")
     parser.add_argument("--fix-hints", action="store_true", help="Display actionable instructions for fixing detected issues.")
+    parser.add_argument("--scope", choices=["all", "repo"], default="all",
+                        help="'repo' gates only on skills whose real path is inside the kirby-skills repo; other skills are reported as excluded.")
     args = parser.parse_args()
 
     # Filter apps if requested
@@ -774,6 +793,11 @@ def main():
     overall_report = {
         "apps": {},
         "workspace": None,
+        "scope": args.scope,
+        "excluded": {
+            "total_skills_detected": 0,
+            **empty_status_counts(),
+        },
         "summary": {
             "total_skills_detected": 0,
             **empty_status_counts(),
@@ -782,6 +806,11 @@ def main():
 
     for app in matched_targets:
         app_skills = collect_app_skills(app)
+        if args.scope == "repo":
+            app_skills, outside = split_by_repo_scope(app_skills, REPO_ROOT)
+            excluded = overall_report["excluded"]
+            excluded["total_skills_detected"] += len(outside)
+            tally_statuses(outside, excluded)
 
         if not app_skills:
             overall_report["apps"][app["name"]] = {
@@ -910,6 +939,14 @@ def main():
         )
         error_label = KIND_BY_NAME[KIND_ERROR].label
         print(f"{colorize('Audit Breakdown:', YELLOW)} {inline_detail}, {total_errors} {error_label} ({error_detail}).")
+
+    if args.scope == "repo":
+        excluded = overall_report["excluded"]
+        print(colorize(
+            f"Excluded (outside repo scope, not gating): {excluded['total_skills_detected']} skills, "
+            f"{excluded['bloat_risks']} bloat risks, {count_by_kind(excluded, KIND_ERROR)} errors.",
+            DIM,
+        ))
 
     if args.fix_hints:
         print(f"\n{bold(colorize('Fix Suggestions & Remediation:', CYAN))}")
